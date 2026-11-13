@@ -1,0 +1,15 @@
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# Compiled Stan model (rebuilt automatically)
+dynamic_bt.rds
+
+# Knit intermediates
+*_files/
+*_cache/
+
+# Posterior caches (about 35 MB): regenerate with refit: true
+bt_dyn_*.rds
