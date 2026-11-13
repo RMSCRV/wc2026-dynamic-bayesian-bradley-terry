@@ -1,0 +1,2 @@
+CXX17FLAGS += -std=gnu++17 -Wno-ignored-attributes -Wno-deprecated-declarations -Wno-attributes
+CXX14FLAGS += -std=gnu++14 -Wno-ignored-attributes -Wno-deprecated-declarations -Wno-attributes

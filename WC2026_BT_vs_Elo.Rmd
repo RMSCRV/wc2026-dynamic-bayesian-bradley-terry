@@ -1,0 +1,1164 @@
+---
+title: "Dynamic Bayesian Bradley-Terry vs Elo: Predicting the 2026 FIFA World Cup Champion"
+date: "14 June 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+params:
+  n_sims: 10000
+  seed: 2026
+  cutoff: "2022-01-01"
+  refetch: false
+  refit: false
+  chains: 4
+  iter: 2000
+  adapt_delta: 0.95
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 6, dpi = 120)
+```
+
+# Research question
+
+> How does a **dynamic Bayesian Bradley-Terry (BT) model**, in which team strengths drift between matches,
+> compare with traditional Elo ratings when predicting the 2026 FIFA World Cup champion?
+
+**Approach**
+
+1. Build a cleaned international-match dataset (2018 onward).
+2. Fit the **dynamic Bayesian BT model**: strengths follow a Gaussian random walk over half-year periods, draws use
+   the Davidson form, and the posterior is sampled with **Hamiltonian Monte Carlo** (Stan, NUTS).
+   Check the sampler (R-hat, effective sample size, divergences).
+3. Test the fit with **posterior predictive checks**.
+4. **Back-test** against Elo, a static time-weighted BT (maximum likelihood) and a penalised Poisson model on
+   held-out, time-ordered matches (RPS, log-loss, Brier).
+5. Simulate the 48-team, 12-group World Cup format 10,000 times per model. The Bayesian model carries its
+   posterior uncertainty into every simulated tournament.
+
+Knit with *Knit with Parameters* in RStudio to change the number of simulations, seed, back-test cut-off date,
+or to re-run the sampler (`refit`). Posterior samples are cached in `.rds` files, so a normal knit does not re-sample.
+
+# 1. Packages
+
+```{r packages}
+library(worldfootballR)
+library(dplyr)
+library(BradleyTerry2)
+library(ggplot2)
+library(gt)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(ggrepel)
+library(viridis)
+library(scales)
+library(tibble)
+library(Matrix)
+library(glmnet)
+```
+
+# 2. Raw data
+
+Matches come from FBref via `worldfootballR`. The download is cached in
+`wc_raw_matches.rds` next to this file; set the `refetch` parameter to `true` to download again.
+
+```{r raw-data}
+comps <- c(
+  "FIFA World Cup",
+  "FIFA World Cup Qualification — AFC",
+  "FIFA World Cup Qualification — CAF",
+  "FIFA World Cup Qualification — CONCACAF",
+  "FIFA World Cup Qualification — CONMEBOL",
+  "FIFA World Cup Qualification — UEFA",
+  "UEFA Nations League",
+  "UEFA European Football Championship",
+  "UEFA European Football Championship Qualifying",
+  "AFC Asian Cup",
+  "Africa Cup of Nations",
+  "CONCACAF Gold Cup",
+  "CONMEBOL Copa América",
+  "International Friendlies (M)"
+)
+
+raw_file <- "wc_raw_matches.rds"
+if (file.exists(raw_file) && !isTRUE(params$refetch)) {
+  df_raw <- readRDS(raw_file)
+} else {
+  df_raw <- load_match_comp_results(comp_name = comps)
+  saveRDS(df_raw, raw_file)
+}
+cat(sprintf("%d raw matches, %d competitions\n", nrow(df_raw), n_distinct(df_raw$Competition_Name)))
+```
+
+# 3. Data cleaning and preparation
+
+## 3.1 Team and competition names
+
+FBref attaches a country code to every team name (e.g. `"United States us"`, `"eng England"`).
+Only lowercase codes are stripped, so names such as `"DR Congo"` are not damaged.
+Competition names are normalised (em dash to hyphen, accents removed) so that they match the weight tables.
+
+```{r names}
+clean_team_name <- function(name) {
+  name <- str_trim(name)
+  name <- str_replace(name, "^[a-z]{2,3}\\s+", "")   # leading code: "us United States", "eng England"
+  name <- str_replace(name, "\\s+[a-z]{2,3}$", "")   # trailing code: "France fr"
+  str_squish(name)
+}
+
+country_map <- c(
+  "USA"                  = "United States",
+  "Korea Republic"       = "South Korea",
+  "Korea Rep"            = "South Korea",
+  "Republic of Korea"    = "South Korea",
+  "Iran"                 = "IR Iran",
+  "Ivory Coast"          = "Cote d'Ivoire",
+  "Cape Verde"           = "Cabo Verde",
+  "Czech Republic"       = "Czechia",
+  "Bosnia"               = "Bosnia and Herzegovina",
+  "Trinidad"             = "Trinidad and Tobago",
+  "United Arab Emirates" = "UAE",
+  "China PR"             = "China",
+  "Chinese Taipei"       = "Taiwan",
+  "DPR Korea"            = "North Korea"
+)
+
+standardise_name <- function(x) {
+  y   <- clean_team_name(x)
+  idx <- match(y, names(country_map))
+  ifelse(is.na(idx), y, unname(country_map)[idx])
+}
+
+normalise_comp <- function(x) {
+  x <- str_replace_all(x, c("—" = "-", "–" = "-", "é" = "e"))
+  str_squish(x)
+}
+```
+
+## 3.2 Weights
+
+* **Competition importance** (used for the Bradley-Terry and Poisson weights).
+* **Elo K-factor** by competition.
+* **Time decay**: exponential, half-life about 2.5 years (912 days), measured back from a reference date.
+  The reference date is the last match in the training data, so the back-test below never looks into the future.
+
+```{r weights}
+comp_weights <- c(
+  "FIFA World Cup"                                 = 3.0,
+  "CONMEBOL Copa America"                          = 2.5,
+  "UEFA European Football Championship"            = 2.5,
+  "Africa Cup of Nations"                          = 2.0,
+  "AFC Asian Cup"                                  = 2.0,
+  "CONCACAF Gold Cup"                              = 2.0,
+  "FIFA World Cup Qualification - UEFA"            = 1.8,
+  "FIFA World Cup Qualification - CONMEBOL"        = 1.8,
+  "FIFA World Cup Qualification - AFC"             = 1.5,
+  "FIFA World Cup Qualification - CAF"             = 1.5,
+  "FIFA World Cup Qualification - CONCACAF"        = 1.5,
+  "UEFA Nations League"                            = 1.5,
+  "UEFA European Football Championship Qualifying" = 1.3,
+  "International Friendlies (M)"                   = 0.5
+)
+
+elo_k_map <- c(
+  "FIFA World Cup"                                 = 60,
+  "CONMEBOL Copa America"                          = 50,
+  "UEFA European Football Championship"            = 50,
+  "Africa Cup of Nations"                          = 40,
+  "AFC Asian Cup"                                  = 40,
+  "CONCACAF Gold Cup"                              = 40,
+  "FIFA World Cup Qualification - UEFA"            = 40,
+  "FIFA World Cup Qualification - CONMEBOL"        = 40,
+  "FIFA World Cup Qualification - AFC"             = 32,
+  "FIFA World Cup Qualification - CAF"             = 32,
+  "FIFA World Cup Qualification - CONCACAF"        = 32,
+  "UEFA Nations League"                            = 35,
+  "UEFA European Football Championship Qualifying" = 30,
+  "International Friendlies (M)"                   = 20
+)
+
+lambda_decay <- log(2) / 912
+
+# time-decay x competition weight, scaled to a maximum of 1
+time_w <- function(d, ref_date) {
+  w <- exp(-lambda_decay * as.numeric(ref_date - d$Date)) * d$comp_weight
+  w / max(w)
+}
+```
+
+## 3.3 Clean match table
+
+```{r clean}
+df_clean <- df_raw %>%
+  rename(Competition = Competition_Name) %>%
+  filter(!is.na(HomeGoals), !is.na(AwayGoals), !is.na(Home), !is.na(Away)) %>%
+  mutate(
+    Competition = normalise_comp(Competition),
+    Date   = as.Date(Date),
+    team1  = standardise_name(Home),
+    team2  = standardise_name(Away),
+    score1 = as.integer(HomeGoals),
+    score2 = as.integer(AwayGoals)
+  ) %>%
+  filter(Date >= as.Date("2018-01-01")) %>%
+  filter(nchar(team1) > 2, nchar(team2) > 2) %>%
+  distinct(Date, team1, team2, score1, score2, .keep_all = TRUE) %>%
+  mutate(
+    comp_weight = unname(comp_weights[Competition]),
+    K           = unname(elo_k_map[Competition])
+  )
+
+# every competition must have found its weight (this was silently failing before)
+stopifnot(!anyNA(df_clean$comp_weight), !anyNA(df_clean$K))
+
+# keep teams with >= 8 matches
+n_by_team <- table(c(df_clean$team1, df_clean$team2))
+eligible_teams <- sort(names(n_by_team)[n_by_team >= 8])
+
+df_clean <- df_clean %>%
+  filter(team1 %in% eligible_teams, team2 %in% eligible_teams) %>%
+  arrange(Date)
+
+t_now <- max(df_clean$Date)
+cat(sprintf("%d matches | %d teams | %s to %s\n", nrow(df_clean), length(eligible_teams),
+            min(df_clean$Date), t_now))
+cat(sprintf("Draw rate: %.1f%% | Mean goals per match: %.2f\n",
+            100 * mean(df_clean$score1 == df_clean$score2),
+            mean(df_clean$score1 + df_clean$score2)))
+```
+
+```{r comp-table}
+df_clean %>%
+  count(Competition, comp_weight, K, name = "matches") %>%
+  arrange(desc(comp_weight)) %>%
+  gt() %>%
+  tab_header(title = "Matches by competition", subtitle = "With importance weight and Elo K-factor")
+```
+
+# 4. The three rating models
+
+Each model is wrapped in a function `fit_*(train, teams, ref_date)` that returns team strengths and a
+`predict(team1, team2)` function giving **Win / Draw / Loss** probabilities at a **neutral venue**.
+This lets the same code be used for the back-test and for the final fit.
+
+## 4.1 Time-weighted Bradley-Terry
+
+Bradley-Terry models `P(i beats j) = plogis(a_i - a_j)`. The original analysis dropped drawn matches,
+which throws away about a quarter of all international games. Here each draw is split into half a win
+for each side (two rows with half weight each), so every match contributes. Fitting uses Firth's
+bias-reduced estimation (`br = TRUE`), which keeps teams with perfect records from getting infinite abilities.
+A switch (`use_draws = FALSE`) reproduces the original decisive-matches-only fit for comparison.
+
+Win/draw/loss probabilities are derived from the BT "score" `p` using a draw probability that is largest for even matches:
+`P(draw) = d * 4p(1 - p)`, where `d` is the weighted draw rate in the training data.
+
+```{r bt-fn}
+wdl_from_p <- function(p, d_bar) {
+  pd <- d_bar * 4 * p * (1 - p)
+  cbind(W = p - pd / 2, D = pd, L = 1 - p - pd / 2)
+}
+
+weighted_draw_rate <- function(d, w) sum(w * (d$score1 == d$score2)) / sum(w)
+
+fit_bt <- function(train, teams, ref_date, use_draws = TRUE) {
+  train$w <- time_w(train, ref_date)
+  dec <- train[train$score1 != train$score2, ]
+  dec$win1 <- as.integer(dec$score1 > dec$score2)
+  dec$win2 <- 1L - dec$win1
+  rows <- dec
+  if (use_draws) {
+    dr <- train[train$score1 == train$score2, ]
+    dr$w <- dr$w / 2
+    a <- dr; a$win1 <- 1L; a$win2 <- 0L
+    b <- dr; b$win1 <- 0L; b$win2 <- 1L
+    rows <- bind_rows(dec, a, b)
+  }
+  rows$team1 <- factor(rows$team1, levels = teams)
+  rows$team2 <- factor(rows$team2, levels = teams)
+
+  fit <- tryCatch(
+    BTm(cbind(win1, win2), team1, team2, weights = w, data = rows, id = "team", br = TRUE),
+    error = function(e)
+      BTm(cbind(win1, win2), team1, team2, weights = w, data = rows, id = "team"))
+
+  ab <- BTabilities(fit)
+  est <- setNames(ab[, "ability"], rownames(ab))
+  se  <- setNames(ab[, "s.e."],    rownames(ab))
+  est[is.na(est)] <- 0
+  full <- setNames(rep(0, length(teams)), teams); full[names(est)] <- est
+  fse  <- setNames(rep(NA_real_, length(teams)), teams); fse[names(se)] <- se
+  d_bar <- weighted_draw_rate(train, train$w)
+
+  list(name = if (use_draws) "Bradley-Terry (draws as half-wins)" else "Bradley-Terry (decisive only)",
+       strength = full, se = fse, d_bar = d_bar,
+       predict = function(t1, t2) wdl_from_p(plogis(full[t1] - full[t2]), d_bar))
+}
+```
+
+## 4.2 Elo
+
+Competition-specific K-factor, margin-of-victory multiplier `log(|gd| + 1) + 1`, draws as 0.5.
+All teams start at 1500 and ratings are updated match by match in date order. The full rating history is kept for plotting.
+
+```{r elo-fn}
+fit_elo <- function(train, teams, ref_date) {
+  d <- train[order(train$Date), ]
+  r <- setNames(rep(1500, length(teams)), teams)
+  n <- nrow(d)
+  hist <- tibble(Date = as.Date(rep(NA, 2 * n)), team = character(2 * n), elo = numeric(2 * n))
+  for (k in seq_len(n)) {
+    h <- d$team1[k]; a <- d$team2[k]
+    Rh <- r[[h]]; Ra <- r[[a]]
+    Eh <- 1 / (1 + 10^((Ra - Rh) / 400))
+    g1 <- d$score1[k]; g2 <- d$score2[k]
+    Sh <- if (g1 > g2) 1 else if (g1 < g2) 0 else 0.5
+    delta <- d$K[k] * (log(abs(g1 - g2) + 1) + 1) * (Sh - Eh)
+    r[[h]] <- Rh + delta
+    r[[a]] <- Ra - delta
+    hist$Date[c(2 * k - 1, 2 * k)] <- d$Date[k]
+    hist$team[c(2 * k - 1, 2 * k)] <- c(h, a)
+    hist$elo[c(2 * k - 1, 2 * k)]  <- c(r[[h]], r[[a]])
+  }
+  d_bar <- weighted_draw_rate(train, time_w(train, ref_date))
+  list(name = "Elo", strength = r, history = hist, d_bar = d_bar,
+       predict = function(t1, t2) wdl_from_p(1 / (1 + 10^((r[t2] - r[t1]) / 400)), d_bar))
+}
+```
+
+## 4.3 Penalised bivariate Poisson
+
+The original "Poisson" rating was the z-score of goal difference per match, which is not a Poisson model.
+Here goals are modelled properly:
+
+* `log(mu_scoring_team) = intercept + attack_i + conceding_j + home`, estimated by weighted, ridge-penalised Poisson
+  regression (`glmnet`, penalty chosen by cross-validation). The ridge penalty stops teams with few matches from
+  getting extreme ratings.
+* The `home` term (the team listed first) absorbs home advantage so it does not contaminate team strengths.
+  Predictions for the World Cup are at a neutral venue (`home = 0`).
+* **Bivariate** part: both teams' goals share a common component `Z ~ Poisson(lambda3)`, estimated from the
+  weighted covariance of the residual goals (floored at 0). Then `X = X1 + Z`, `Y = Y1 + Z`, which allows goals to be positively
+  correlated (more draws and more high-scoring games than independent Poisson). If the data show no positive correlation,
+  `lambda3 = 0` and the model is independent Poisson (see the limitations section for the fitted value).
+
+```{r pois-fn}
+# W/D/L probabilities from the bivariate Poisson with marginal means m1, m2 and shared rate l3
+biv_wdl <- function(m1, m2, l3, kmax = 10) {
+  out <- matrix(0, length(m1), 3, dimnames = list(NULL, c("W", "D", "L")))
+  for (n in seq_along(m1)) {
+    a <- max(m1[n] - l3, 0.02); b <- max(m2[n] - l3, 0.02)
+    pa <- dpois(0:kmax, a);     pb <- dpois(0:kmax, b)
+    P  <- matrix(0, kmax + 1, kmax + 1)
+    for (k in 0:kmax) {
+      sx <- c(rep(0, k), pa)[1:(kmax + 1)]
+      sy <- c(rep(0, k), pb)[1:(kmax + 1)]
+      P  <- P + dpois(k, l3) * outer(sx, sy)
+    }
+    P <- P / sum(P)
+    out[n, ] <- c(sum(P[row(P) > col(P)]), sum(diag(P)), sum(P[row(P) < col(P)]))
+  }
+  out
+}
+
+fit_pois <- function(train, teams, ref_date) {
+  nt <- length(teams)
+  w  <- time_w(train, ref_date)
+  n  <- nrow(train)
+  i1 <- match(train$team1, teams); i2 <- match(train$team2, teams)
+  # long format: one row per team per match. columns = attack (nt) | conceding (nt) | home (1)
+  rows <- 1:(2 * n)
+  X <- sparseMatrix(
+    i = rep(rows, 3),
+    j = c(c(i1, i2), nt + c(i2, i1), rep(2 * nt + 1, 2 * n)),
+    x = c(rep(1, 4 * n), rep(c(1, 0), each = n)),
+    dims = c(2 * n, 2 * nt + 1))
+  X <- drop0(X)
+  y  <- c(train$score1, train$score2)
+  ww <- c(w, w)
+  pf <- c(rep(1, 2 * nt), 0)                      # home effect is not penalised
+
+  set.seed(1)
+  cv  <- cv.glmnet(X, y, family = "poisson", weights = ww, alpha = 0, nfolds = 5,
+                   penalty.factor = pf, standardize = FALSE)
+  cf  <- as.numeric(coef(cv, s = "lambda.min"))
+  int <- cf[1]
+  att <- setNames(cf[2:(nt + 1)], teams)
+  con <- setNames(cf[(nt + 2):(2 * nt + 1)], teams)   # > 0 means the team concedes more
+  hom <- cf[2 * nt + 2]
+
+  m1 <- exp(int + att[train$team1] + con[train$team2] + hom)
+  m2 <- exp(int + att[train$team2] + con[train$team1])
+  l3 <- max(0, min(0.3, sum(w * (train$score1 - m1) * (train$score2 - m2)) / sum(w)))
+
+  list(name = "Bivariate Poisson", att = att, con = con, int = int, home = hom, l3 = l3,
+       strength = att - con,
+       predict = function(t1, t2) {
+         biv_wdl(exp(int + att[t1] + con[t2]), exp(int + att[t2] + con[t1]), l3)
+       })
+}
+```
+
+## 4.4 Dynamic Bayesian Bradley-Terry with draws (headline model)
+
+The models above give one fixed rating per team, with fixed weights to forget old matches. The Bayesian model treats
+team strength as something that **changes over time** and learns how fast from the data.
+
+**Model.** Time is split into half-year periods $t = 1, \dots, T$. Team $j$ has strength $\beta_{j,t}$ in period $t$.
+
+$$
+\beta_{j,1} = \sigma_0\, z_j, \qquad \beta_{j,t} = \beta_{j,t-1} + \sigma_{\text{drift}}\, \varepsilon_{j,t}, \qquad z_j, \varepsilon_{j,t} \sim N(0,1)
+$$
+
+For a match in period $t$, let $d = \beta_{i,t} - \beta_{j,t} + h \cdot \text{home}$. The result probabilities are (Davidson form):
+
+$$
+P(i \text{ wins}) = \frac{e^{d/2}}{e^{d/2} + e^{-d/2} + \nu}, \quad
+P(\text{draw}) = \frac{\nu}{e^{d/2} + e^{-d/2} + \nu}, \quad
+P(j \text{ wins}) = \frac{e^{-d/2}}{e^{d/2} + e^{-d/2} + \nu}
+$$
+
+**Priors.** $\sigma_0 \sim N^+(0,1)$, $\sigma_{\text{drift}} \sim N^+(0, 0.3)$, $h \sim N(0, 0.5)$, $\log\nu \sim N(0,1)$.
+The random-walk innovations are sampled in standardised ("non-centred") form so that HMC explores the posterior efficiently.
+
+**Home advantage.** `home = 1` when the first-listed team plays at home. It is `0` for tournament finals
+(World Cup, Euros, Copa América, AFCON, Asian Cup, Gold Cup), where the venue is treated as neutral. This is an assumption, because the data has no venue flag for every match.
+
+**Sampling.** Hamiltonian Monte Carlo with the No-U-Turn sampler (NUTS) in Stan. Competition weights are not used here:
+drift replaces time weighting, and every match counts equally in the likelihood.
+
+The Stan program (`dynamic_bt.stan`):
+
+```{r show-stan, echo=FALSE, comment=""}
+cat(readLines("dynamic_bt.stan"), sep = "\n")
+```
+
+```{r dyn-fn}
+finals_comps <- c("FIFA World Cup", "UEFA European Football Championship", "AFC Asian Cup",
+                  "Africa Cup of Nations", "CONCACAF Gold Cup", "CONMEBOL Copa America")
+
+# half-year periods counted from 2018: 2018H1 = 1, 2018H2 = 2, ...
+period_of <- function(date) (year(date) - 2018L) * 2L + ifelse(month(date) <= 6, 1L, 2L)
+
+make_stan_data <- function(d, teams) {
+  per <- period_of(d$Date)
+  list(N = nrow(d), J = length(teams), T = max(per, 2L),
+       team1 = match(d$team1, teams), team2 = match(d$team2, teams),
+       period = per,
+       y = ifelse(d$score1 > d$score2, 3L, ifelse(d$score1 == d$score2, 2L, 1L)),
+       home = as.numeric(!d$Competition %in% finals_comps))
+}
+
+# Sample (or load from cache) the posterior. Returns a plain list so a cached knit does not need rstan.
+fit_dyn_bt <- function(d, teams, cache_file) {
+  sdat <- make_stan_data(d, teams)
+  key  <- list(N = sdat$N, J = sdat$J, T = sdat$T, iter = params$iter, chains = params$chains,
+               seed = params$seed, adapt_delta = params$adapt_delta, last = as.character(max(d$Date)))
+  if (file.exists(cache_file) && !isTRUE(params$refit)) {
+    obj <- readRDS(cache_file)
+    if (identical(obj$key, key)) return(obj)
+  }
+  if (!requireNamespace("rstan", quietly = TRUE))
+    stop("Package 'rstan' is needed to sample the posterior. Install it with install.packages('rstan').")
+  rstan::rstan_options(auto_write = TRUE)
+  # rstan appends -std=c++1y, but recent Stan versions need C++17. Makevars.win (in this folder) restores it.
+  if (file.exists("Makevars.win")) Sys.setenv(R_MAKEVARS_USER = normalizePath("Makevars.win"))
+  mod <- rstan::stan_model("dynamic_bt.stan")
+  fit <- rstan::sampling(mod, data = sdat, chains = params$chains, iter = params$iter,
+                         warmup = params$iter / 2, seed = params$seed, refresh = 0,
+                         cores = min(params$chains, parallel::detectCores()),
+                         control = list(adapt_delta = params$adapt_delta, max_treedepth = 12))
+
+  sp   <- rstan::get_sampler_params(fit, inc_warmup = FALSE)
+  hyp  <- c("sigma0", "sigma_drift", "h", "nu")
+  bsum <- rstan::summary(fit, pars = "beta")$summary
+  ex   <- rstan::extract(fit, pars = c("beta", "sigma0", "sigma_drift", "h", "nu", "y_rep"))
+  idx  <- seq(1, dim(ex$beta)[1], by = 4)                       # thin to ~1000 draws for storage
+
+  obj <- list(
+    key = key, data = sdat, teams = teams,
+    diag = list(
+      divergences  = sum(vapply(sp, function(x) sum(x[, "divergent__"]), numeric(1))),
+      depth_hits   = sum(vapply(sp, function(x) sum(x[, "treedepth__"] >= 12), numeric(1))),
+      min_ebfmi    = min(rstan::get_bfmi(fit)),
+      max_rhat     = max(bsum[, "Rhat"], na.rm = TRUE),
+      min_neff     = min(bsum[, "n_eff"], na.rm = TRUE),
+      runtime_secs = sum(rstan::get_elapsed_time(fit))),
+    hyper_summary = rstan::summary(fit, pars = hyp)$summary[, c("mean", "sd", "2.5%", "97.5%", "n_eff", "Rhat")],
+    hyper_trace   = as.array(fit, pars = hyp),                  # iterations x chains x parameters
+    post = list(beta = ex$beta[idx, , , drop = FALSE], sigma0 = ex$sigma0[idx],
+                sigma_drift = ex$sigma_drift[idx], h = ex$h[idx], nu = ex$nu[idx],
+                y_rep = ex$y_rep[idx, , drop = FALSE]))
+  saveRDS(obj, cache_file)
+  obj
+}
+
+# Posterior predictive W/D/L probabilities at a neutral venue, k periods after the last fitted period.
+# Strengths drift forward as a random walk, so predictions further ahead are less certain.
+dyn_predict <- function(obj, t1, t2, k) {
+  b  <- obj$post$beta
+  bT <- b[, , dim(b)[3]]                                        # draws x teams
+  sd_drift <- obj$post$sigma_drift; nu <- obj$post$nu; S <- length(nu)
+  i1 <- match(t1, obj$teams); i2 <- match(t2, obj$teams)
+  out <- matrix(0, length(t1), 3, dimnames = list(NULL, c("W", "D", "L")))
+  for (m in seq_along(t1)) {
+    d <- bT[, i1[m]] - bT[, i2[m]]
+    if (k[m] > 0) d <- d + sd_drift * sqrt(2 * k[m]) * rnorm(S)  # both teams drift
+    den <- exp(d / 2) + exp(-d / 2) + nu
+    out[m, ] <- c(mean(exp(d / 2) / den), mean(nu / den), mean(exp(-d / 2) / den))
+  }
+  out
+}
+```
+
+# 5. Back-test: how well does each model predict unseen matches?
+
+Models are fitted only on matches **before** the cut-off (`r params$cutoff`) and scored on every later match between teams
+that appear in the training data. Predictions are neutral-venue for all models, so this tests team strength only.
+
+* **RPS** (ranked probability score) treats Win > Draw > Loss as ordered, lower is better, and is the standard
+  football-forecasting metric.
+* **Log-loss** and **Brier score**: lower is better.
+* *Baseline*: always predict the training-set win/draw/loss frequencies.
+
+```{r backtest}
+cutoff <- as.Date(params$cutoff)
+train  <- df_clean %>% filter(Date <  cutoff)
+test   <- df_clean %>% filter(Date >= cutoff)
+
+n_tr <- table(c(train$team1, train$team2))
+bt_teams <- sort(names(n_tr)[n_tr >= 8])
+train <- train %>% filter(team1 %in% bt_teams, team2 %in% bt_teams)
+test  <- test  %>% filter(team1 %in% bt_teams, team2 %in% bt_teams)
+ref_tr <- max(train$Date)
+
+outcome <- ifelse(test$score1 > test$score2, 1L, ifelse(test$score1 == test$score2, 2L, 3L))  # W, D, L
+
+score_probs <- function(P, o) {
+  P <- pmax(P, 1e-12); P <- P / rowSums(P)
+  n <- length(o)
+  O <- matrix(0, n, 3); O[cbind(1:n, o)] <- 1
+  cp <- t(apply(P, 1, cumsum)); co <- t(apply(O, 1, cumsum))
+  c(RPS      = mean(0.5 * ((cp[, 1] - co[, 1])^2 + (cp[, 2] - co[, 2])^2)),
+    LogLoss  = -mean(log(P[cbind(1:n, o)])),
+    Brier    = mean(rowSums((P - O)^2)),
+    Accuracy = mean(max.col(P, ties.method = "first") == o))
+}
+
+m_bt0  <- fit_bt(train, bt_teams, ref_tr, use_draws = FALSE)
+m_bt   <- fit_bt(train, bt_teams, ref_tr, use_draws = TRUE)
+m_elo  <- fit_elo(train, bt_teams, ref_tr)
+m_pois <- fit_pois(train, bt_teams, ref_tr)
+
+# Dynamic Bayesian BT: posterior from the training matches only; strengths then drift forward
+# k periods to each test match.
+m_dyn_train <- fit_dyn_bt(train, bt_teams, "bt_dyn_train.rds")
+k_ahead <- pmax(period_of(test$Date) - m_dyn_train$data$T, 0L)
+set.seed(params$seed)
+P_dyn <- dyn_predict(m_dyn_train, test$team1, test$team2, k_ahead)
+
+freq <-as.numeric(prop.table(table(factor(
+  ifelse(train$score1 > train$score2, 1L, ifelse(train$score1 == train$score2, 2L, 3L)), levels = 1:3))))
+P_base <- matrix(freq, nrow(test), 3, byrow = TRUE)
+
+bt_results <- bind_rows(
+  tibble(Model = "Baseline (outcome frequencies)", !!!as.list(score_probs(P_base, outcome))),
+  tibble(Model = paste(m_bt0$name, "- static MLE"), !!!as.list(score_probs(m_bt0$predict(test$team1, test$team2),  outcome))),
+  tibble(Model = paste(m_bt$name,  "- static MLE"), !!!as.list(score_probs(m_bt$predict(test$team1, test$team2),   outcome))),
+  tibble(Model = m_elo$name,  !!!as.list(score_probs(m_elo$predict(test$team1, test$team2),  outcome))),
+  tibble(Model = m_pois$name, !!!as.list(score_probs(m_pois$predict(test$team1, test$team2), outcome))),
+  tibble(Model = "Dynamic Bayesian BT (HMC)", !!!as.list(score_probs(P_dyn, outcome)))
+)
+
+bt_results %>%
+  gt() %>%
+  tab_header(title = "Out-of-sample accuracy",
+             subtitle = sprintf("Train: %s to %s (%d matches) | Test: %d matches from %s",
+                                min(train$Date), ref_tr, nrow(train), nrow(test), cutoff)) %>%
+  fmt_number(columns = c(RPS, LogLoss, Brier), decimals = 4) %>%
+  fmt_percent(columns = Accuracy, decimals = 1) %>%
+  tab_style(style = cell_text(weight = "bold"),
+            locations = list(
+              cells_body(columns = RPS,     rows = RPS     == min(RPS)),
+              cells_body(columns = LogLoss, rows = LogLoss == min(LogLoss)),
+              cells_body(columns = Brier,   rows = Brier   == min(Brier)),
+              cells_body(columns = Accuracy, rows = Accuracy == max(Accuracy)))) %>%
+  tab_source_note("Best value in each column in bold. Lower is better except accuracy.")
+```
+
+# 6. Final models (all data to the last available match)
+
+```{r final-fit}
+teams_all <- eligible_teams
+dyn    <- fit_dyn_bt(df_clean, teams_all, "bt_dyn_final.rds")
+f_elo  <- fit_elo(df_clean,  teams_all, t_now)
+f_pois <- fit_pois(df_clean, teams_all, t_now)
+cat(sprintf("Last match in data: %s | Poisson shared rate lambda3 = %.3f | home effect = %.3f (log scale)\n",
+            t_now, f_pois$l3, f_pois$home))
+```
+
+## 6.1 Did the sampler work? (HMC diagnostics)
+
+Rules of thumb for a trustworthy posterior: R-hat below 1.01, effective sample size (ESS) in the hundreds,
+no divergent transitions, E-BFMI above 0.3, and no iterations hitting the maximum tree depth.
+
+```{r diagnostics}
+dg <- dyn$diag
+tibble(
+  Check = c("Chains x post-warmup draws", "Divergent transitions", "Max R-hat (all strengths)",
+            "Min effective sample size (all strengths)", "Min E-BFMI", "Iterations at max tree depth",
+            "Sampling time (seconds, all chains)"),
+  Value = c(sprintf("%d x %d", params$chains, params$iter / 2), dg$divergences,
+            sprintf("%.3f", dg$max_rhat), sprintf("%.0f", dg$min_neff), sprintf("%.2f", dg$min_ebfmi),
+            dg$depth_hits, sprintf("%.0f", dg$runtime_secs))
+) %>% gt() %>% tab_header(title = "HMC / NUTS diagnostics", subtitle = "Final model, all data")
+```
+
+```{r hyper-table}
+as.data.frame(dyn$hyper_summary) %>%
+  rownames_to_column("Parameter") %>%
+  mutate(Parameter = recode(Parameter, sigma0 = "sigma0 (initial spread)", sigma_drift = "sigma_drift (per half-year)",
+                            h = "h (home advantage)", nu = "nu (draw parameter)")) %>%
+  gt() %>%
+  tab_header(title = "Posterior summaries: hyperparameters") %>%
+  fmt_number(c(mean, sd, `2.5%`, `97.5%`), decimals = 3) %>%
+  fmt_number(n_eff, decimals = 0) %>% fmt_number(Rhat, decimals = 3) %>%
+  cols_label(n_eff = "ESS", `2.5%` = "2.5%", `97.5%` = "97.5%")
+```
+
+```{r trace, fig.height=6}
+tr <- dyn$hyper_trace
+trace_df <- do.call(rbind, lapply(seq_len(dim(tr)[3]), function(p)
+  data.frame(iter = rep(seq_len(dim(tr)[1]), dim(tr)[2]), chain = factor(rep(seq_len(dim(tr)[2]), each = dim(tr)[1])),
+             parameter = dimnames(tr)[[3]][p], value = as.vector(tr[, , p]))))
+
+ggplot(trace_df, aes(iter, value, colour = chain)) +
+  geom_line(alpha = 0.6, linewidth = 0.3) +
+  facet_wrap(~parameter, scales = "free_y", ncol = 2) +
+  scale_colour_viridis_d(end = 0.85) +
+  labs(title = "Trace plots of the hyperparameters",
+       subtitle = "Chains should overlap and look like noise around a constant level",
+       x = "Post-warmup iteration", y = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+```
+
+## 6.2 Posterior predictive checks
+
+If the model is a good description of the data, results simulated from the fitted model (`y_rep`) should look like
+the observed results. Each check compares a feature of the real data with its distribution across the replicated datasets.
+A **posterior predictive p-value** (ppp) near 0 or 1 signals a feature the model does not capture.
+
+```{r ppc-setup}
+yo   <- dyn$data$y                   # 1 = team 2 wins, 2 = draw, 3 = team 1 wins
+yr   <- dyn$post$y_rep               # draws x matches
+N    <- length(yo)
+S    <- nrow(yr)
+bpm  <- apply(dyn$post$beta, c(2, 3), mean)                 # posterior-mean strengths (teams x periods)
+gap  <- abs(bpm[cbind(dyn$data$team1, dyn$data$period)] - bpm[cbind(dyn$data$team2, dyn$data$period)])
+```
+
+**Check 1: overall result frequencies.**
+
+```{r ppc-shares, fig.height=4.5}
+share_obs <- tabulate(yo, 3) / N
+share_rep <- t(apply(yr, 1, function(r) tabulate(r, 3) / N))
+lab <- c("Team 2 wins", "Draw", "Team 1 wins")
+ppc1 <- bind_rows(lapply(1:3, function(k) tibble(outcome = lab[k], rep = share_rep[, k], obs = share_obs[k])))
+ppp1 <- sapply(1:3, function(k) mean(share_rep[, k] >= share_obs[k])); names(ppp1) <- lab
+
+ggplot(ppc1, aes(rep)) +
+  geom_histogram(bins = 30, fill = "#457B9D", alpha = 0.8) +
+  geom_vline(aes(xintercept = obs), colour = "#E63946", linewidth = 1) +
+  facet_wrap(~factor(outcome, levels = lab), scales = "free") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "PPC 1: share of each result", subtitle = "Histogram = replicated datasets, red line = observed",
+       x = NULL, y = "Replicated datasets") +
+  theme_minimal(base_size = 12) + theme(plot.title = element_text(face = "bold"))
+```
+
+**Check 2: do draws become less likely as the strength gap grows?** Matches are split into five bins by the size of the
+posterior-mean strength gap. The draw rate in each bin is compared with the replicated draw rate.
+
+```{r ppc-gap, fig.height=4.5}
+bin <- cut(gap, quantile(gap, 0:5 / 5), include.lowest = TRUE, labels = paste0("Q", 1:5))
+ppc2 <- bind_rows(lapply(levels(bin), function(b) {
+  ii <- which(bin == b); dr <- rowMeans(yr[, ii, drop = FALSE] == 2)
+  tibble(bin = b, obs = mean(yo[ii] == 2), lo = quantile(dr, 0.05), hi = quantile(dr, 0.95),
+         med = median(dr), ppp = mean(dr >= mean(yo[ii] == 2)))
+}))
+
+ggplot(ppc2, aes(bin)) +
+  geom_linerange(aes(ymin = lo, ymax = hi), linewidth = 4, colour = "#A8DADC") +
+  geom_point(aes(y = med), shape = 95, size = 8, colour = "#457B9D") +
+  geom_point(aes(y = obs), size = 3.5, colour = "#E63946") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "PPC 2: draw rate by strength gap",
+       subtitle = "Band = 90% of replicated draw rates, red dot = observed (Q1 = evenly matched, Q5 = biggest gap)",
+       x = "Strength-gap quintile", y = "Draw rate") +
+  theme_minimal(base_size = 12) + theme(plot.title = element_text(face = "bold"))
+```
+
+**Check 3: is home advantage stable over time?** Share of wins for the first-listed team, per half-year period.
+
+```{r ppc-period, fig.height=4.5}
+per_s <- sort(unique(dyn$data$period))
+ppc3 <- bind_rows(lapply(per_s, function(p) {
+  ii <- which(dyn$data$period == p); w <- rowMeans(yr[, ii, drop = FALSE] == 3)
+  tibble(period = p, n = length(ii), obs = mean(yo[ii] == 3), lo = quantile(w, 0.05), hi = quantile(w, 0.95),
+         ppp = mean(w >= mean(yo[ii] == 3)))
+})) %>% mutate(date = as.Date(sprintf("%d-%02d-01", 2018 + (period - 1) %/% 2, ifelse(period %% 2 == 1, 1, 7))))
+
+ggplot(ppc3, aes(date)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), fill = "#A8DADC", alpha = 0.8) +
+  geom_line(aes(y = obs), colour = "#E63946", linewidth = 0.9) + geom_point(aes(y = obs), colour = "#E63946") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "PPC 3: first-listed team win share over time",
+       subtitle = "Band = 90% of replicated shares, red = observed", x = NULL, y = "Win share") +
+  theme_minimal(base_size = 12) + theme(plot.title = element_text(face = "bold"))
+```
+
+**Check 4: team results.** Points per game for every team with at least 30 matches: observed against the 90% replicated interval.
+About 10% of teams are expected to fall outside by chance.
+
+```{r ppc-teams, fig.height=6}
+pts1 <- c(0, 1, 3); pts2 <- c(3, 1, 0)
+team_ppc <- bind_rows(lapply(seq_along(teams_all), function(j) {
+  a <- which(dyn$data$team1 == j); b <- which(dyn$data$team2 == j); n <- length(a) + length(b)
+  if (n < 30) return(NULL)
+  obs <- (sum(pts1[yo[a]]) + sum(pts2[yo[b]])) / n
+  rep <- (rowSums(matrix(pts1[yr[, a]], S)) + rowSums(matrix(pts2[yr[, b]], S))) / n
+  tibble(team = teams_all[j], n = n, obs = obs, mean_rep = mean(rep),
+         lo = quantile(rep, 0.05), hi = quantile(rep, 0.95), outside = obs < lo | obs > hi)
+}))
+
+ggplot(team_ppc, aes(mean_rep, obs, colour = outside)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey60") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0, alpha = 0.5) +
+  geom_point(size = 2) +
+  geom_text_repel(data = filter(team_ppc, outside), aes(label = team), size = 3, show.legend = FALSE) +
+  scale_colour_manual(values = c(`FALSE` = "#457B9D", `TRUE` = "#E63946"), labels = c("Inside", "Outside"), name = "Observed vs 90% band") +
+  labs(title = "PPC 4: points per game by team",
+       subtitle = "Horizontal bars = 90% replicated interval; points on the diagonal are perfectly reproduced",
+       x = "Replicated points per game (mean)", y = "Observed points per game") +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+```
+
+```{r ppc-summary}
+tibble(
+  Check = c("Share: team 2 wins", "Share: draws", "Share: team 1 wins", "Draw rate: worst gap quintile",
+            "Win share: worst period", "Teams outside 90% band"),
+  `Statistic` = c(sprintf("ppp = %.2f", ppp1[1]), sprintf("ppp = %.2f", ppp1[2]), sprintf("ppp = %.2f", ppp1[3]),
+                  sprintf("ppp = %.2f (%s)", ppc2$ppp[which.max(abs(ppc2$ppp - 0.5))], ppc2$bin[which.max(abs(ppc2$ppp - 0.5))]),
+                  sprintf("ppp = %.2f", ppc3$ppp[which.max(abs(ppc3$ppp - 0.5))]),
+                  sprintf("%d of %d (%.0f%%; about 10%% expected)", sum(team_ppc$outside), nrow(team_ppc), 100 * mean(team_ppc$outside)))
+) %>% gt() %>% tab_header(title = "Posterior predictive check summary") %>%
+  tab_source_note("ppp = share of replicated datasets at least as large as the observed value. Values near 0 or 1 flag misfit.")
+```
+
+## 6.3 How strengths drift
+
+Posterior mean and 90% credible band of $\beta_{j,t}$ for the eight strongest teams. A flat line would mean no drift.
+
+```{r trajectories, fig.height=6.5}
+Tn <- dim(dyn$post$beta)[3]
+top8_dyn <- order(-colMeans(dyn$post$beta[, , Tn]))[1:8]
+traj <- bind_rows(lapply(top8_dyn, function(j) {
+  tibble(team = teams_all[j], period = 1:Tn,
+         mean = apply(dyn$post$beta[, j, ], 2, mean),
+         lo = apply(dyn$post$beta[, j, ], 2, quantile, 0.05),
+         hi = apply(dyn$post$beta[, j, ], 2, quantile, 0.95))
+})) %>% mutate(date = as.Date(sprintf("%d-%02d-01", 2018 + (period - 1) %/% 2, ifelse(period %% 2 == 1, 1, 7))))
+
+ggplot(traj, aes(date, mean, colour = team, fill = team)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.12, colour = NA) +
+  geom_line(linewidth = 1) +
+  scale_colour_viridis_d(option = "turbo") + scale_fill_viridis_d(option = "turbo") +
+  labs(title = "Dynamic team strength (posterior mean and 90% credible band)",
+       subtitle = "Top 8 teams by final strength; higher is stronger", x = NULL, y = "Strength (log-odds scale)",
+       colour = NULL, fill = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+```
+
+## 6.4 Rating tables
+
+```{r tables}
+style_top3 <- function(g, rank_col, fill) {
+  g %>%
+    tab_style(cell_text(weight = "bold"), cells_body(columns = all_of(rank_col), rows = .data[[rank_col]] <= 3)) %>%
+    tab_style(cell_fill(color = fill),    cells_body(rows = .data[[rank_col]] <= 3)) %>%
+    tab_options(table.font.size = 12)
+}
+
+bT <- dyn$post$beta[, , dim(dyn$post$beta)[3]]          # posterior draws of final-period strengths (draws x teams)
+bt_tbl <- tibble(team = teams_all, ability = colMeans(bT), se_bt = apply(bT, 2, sd),
+                 lo = apply(bT, 2, quantile, 0.05), hi = apply(bT, 2, quantile, 0.95)) %>%
+  arrange(desc(ability)) %>% mutate(rank_bt = row_number())
+
+pois_tbl <- tibble(team = teams_all, attack = f_pois$att[teams_all], defence = -f_pois$con[teams_all]) %>%
+  mutate(net = attack + defence) %>%
+  arrange(desc(net)) %>% mutate(rank_pois = row_number())
+
+elo_tbl <- tibble(team = teams_all, elo = f_elo$strength[teams_all]) %>%
+  arrange(desc(elo)) %>% mutate(rank_elo = row_number())
+
+bt_tbl %>% slice_head(n = 20) %>% dplyr::select(rank_bt, team, ability, se_bt, lo, hi) %>% gt() %>%
+  tab_header(title = "Top 20 teams: dynamic Bayesian Bradley-Terry strength",
+             subtitle = "Posterior of the final-period strength, log-odds scale") %>%
+  cols_label(rank_bt = "Rank", team = "Team", ability = "Posterior mean", se_bt = "Posterior SD",
+             lo = "5%", hi = "95%") %>%
+  fmt_number(c(ability, se_bt, lo, hi), decimals = 2) %>% style_top3("rank_bt", "lightgoldenrodyellow")
+```
+
+```{r pois-table}
+pois_tbl %>% slice_head(n = 20) %>% dplyr::select(rank_pois, team, attack, defence, net) %>% gt() %>%
+  tab_header(title = "Top 20 teams: penalised bivariate Poisson",
+             subtitle = "Log-scale effects on goals; higher is better for both attack and defence") %>%
+  cols_label(rank_pois = "Rank", team = "Team", attack = "Attack", defence = "Defence", net = "Net strength") %>%
+  fmt_number(c(attack, defence, net), decimals = 2) %>% style_top3("rank_pois", "lightblue")
+```
+
+```{r elo-table}
+elo_tbl %>% slice_head(n = 20) %>% dplyr::select(rank_elo, team, elo) %>% gt() %>%
+  tab_header(title = "Top 20 teams: Elo rating", subtitle = "Competition-weighted K, margin-of-victory multiplier") %>%
+  cols_label(rank_elo = "Rank", team = "Team", elo = "Elo") %>%
+  fmt_number(elo, decimals = 0) %>% style_top3("rank_elo", "lightgreen")
+```
+
+## 6.1 Composite ranking
+
+The three strength scales are min-max normalised to 0-1 and averaged with equal weights. The top 48 teams on this
+composite are used as the 2026 field. (The data contains no 2026 qualifiers, so this is a "strongest 48" proxy, not the official draw.)
+
+```{r composite}
+combined <- bt_tbl %>%
+  inner_join(pois_tbl, by = "team") %>%
+  inner_join(elo_tbl,  by = "team") %>%
+  mutate(
+    norm_bt   = (ability - min(ability)) / (max(ability) - min(ability)),
+    norm_pois = (net - min(net)) / (max(net) - min(net)),
+    norm_elo  = (elo - min(elo)) / (max(elo) - min(elo)),
+    composite = (norm_bt + norm_pois + norm_elo) / 3
+  ) %>%
+  arrange(desc(composite)) %>%
+  mutate(rank_composite = row_number())
+
+combined %>% slice_head(n = 20) %>%
+  dplyr::select(rank_composite, team, ability, net, elo, composite) %>% gt() %>%
+  tab_header(title = md("**Top 20 overall teams**"),
+             subtitle = md("*Composite of Bradley-Terry, Poisson and Elo*")) %>%
+  cols_label(rank_composite = "Rank", team = "Team", ability = "BT ability",
+             net = "Poisson net", elo = "Elo", composite = "Composite") %>%
+  fmt_number(c(ability, net), decimals = 2) %>% fmt_number(elo, decimals = 0) %>%
+  fmt_number(composite, decimals = 3) %>%
+  tab_style(cell_fill(color = "#ffd700"), cells_body(rows = rank_composite <= 3)) %>%
+  tab_style(cell_fill(color = "#c0c0c0"), cells_body(rows = rank_composite %in% 4:5)) %>%
+  tab_style(cell_fill(color = "#cd7f32"), cells_body(rows = rank_composite %in% 6:10)) %>%
+  tab_source_note("Equal-weight average of min-max normalised BT, Poisson and Elo scores.")
+```
+
+# 7. Monte Carlo simulation of the 2026 format
+
+**Format**: 48 teams, 12 groups of 4 (teams seeded into groups by composite rank, one from each tier). The top two in each
+group plus the 8 best third-placed teams (32 teams) go to a knockout bracket. Group ties are broken by points, goal difference,
+goals scored, then at random. The knockout draw is random (the real bracket is fixed by FIFA's pairing table, which is not
+modelled), all matches are on neutral ground, and drawn knockout matches are decided 50/50 (penalties).
+
+For each model, a 48 x 48 table of match probabilities (or goal rates) is precomputed once, so the simulation itself is fast.
+The random seed is set **once** before all simulations so results are reproducible.
+
+* The Dynamic Bayesian BT and Elo models give Win/Draw/Loss probabilities; a win is recorded as 1-0 and a draw as 0-0 for tie-break purposes.
+* **The Bayesian model carries its uncertainty into the forecast.** Each simulated tournament uses a different posterior draw of all
+  team strengths, and strengths are first drifted forward from the last data period to the tournament (June 2026) with the
+  fitted random-walk volatility. Elo and Poisson use a single point estimate.
+* The Poisson model simulates actual scores from the bivariate Poisson.
+
+```{r sim-setup}
+wc_teams <- combined$team[1:48]
+nT <- length(wc_teams)
+
+mat_from <- function(fun) {            # fun(t1, t2) -> n x 3 matrix, applied to all ordered pairs
+  g <- expand.grid(i = 1:nT, j = 1:nT)
+  P <- fun(wc_teams[g$i], wc_teams[g$j])
+  lapply(1:3, function(k) matrix(P[, k], nT, nT))
+}
+
+P_elo <- mat_from(f_elo$predict)
+
+# Bayesian model: posterior draws of the 48 teams' strengths at the tournament date.
+# The tournament starts about 2 half-year periods after the last fitted period, so add random-walk drift.
+Tn      <- dim(dyn$post$beta)[3]
+k_wc    <- max(period_of(as.Date("2026-06-11")) - Tn, 0L)
+S_post  <- length(dyn$post$nu)
+set.seed(params$seed + 1)
+B_wc <- dyn$post$beta[, match(wc_teams, teams_all), Tn] +
+  sqrt(k_wc) * as.numeric(dyn$post$sigma_drift) * matrix(rnorm(S_post * nT), S_post, nT)
+cat(sprintf("Strengths drifted forward %d half-year periods from the last data period to the tournament.\n", k_wc))
+
+# one posterior draw -> 48 x 48 win and draw probability tables
+draw_wdl <- function(m) {
+  s   <- sample.int(nrow(m$beta), 1)
+  d   <- outer(m$beta[s, ], m$beta[s, ], "-")
+  den <- exp(d / 2) + exp(-d / 2) + m$nu[s]
+  list(type = "wdl", pw = exp(d / 2) / den, pd = m$nu[s] / den)
+}
+M_pois <- local({
+  g  <- expand.grid(i = 1:nT, j = 1:nT)
+  mu <- exp(f_pois$int + f_pois$att[wc_teams[g$i]] + f_pois$con[wc_teams[g$j]])
+  matrix(mu, nT, nT)
+})
+
+models <- list(
+  "Dynamic Bayesian BT" = list(type = "bayes", beta = B_wc, nu = dyn$post$nu),
+  "Bivariate Poisson" = list(type = "pois", a = pmax(M_pois - f_pois$l3, 0.02), l3 = f_pois$l3),
+  "Elo"               = list(type = "wdl",  pw = P_elo[[1]], pd = P_elo[[2]])
+)
+
+sim_match <- function(i, j, m) {
+  if (m$type == "wdl") {
+    u <- runif(1)
+    if (u < m$pw[i, j]) c(1L, 0L) else if (u < m$pw[i, j] + m$pd[i, j]) c(0L, 0L) else c(0L, 1L)
+  } else {
+    z <- rpois(1, m$l3)
+    c(rpois(1, m$a[i, j]) + z, rpois(1, m$a[j, i]) + z)
+  }
+}
+
+groups <- lapply(1:12, function(g) seq(g, 48, by = 12))
+
+sim_group <- function(idx, m) {
+  pts <- gd <- gf <- numeric(4)
+  for (a in 1:3) for (b in (a + 1):4) {
+    r <- sim_match(idx[a], idx[b], m)
+    d <- r[1] - r[2]
+    gd[a] <- gd[a] + d; gd[b] <- gd[b] - d
+    gf[a] <- gf[a] + r[1]; gf[b] <- gf[b] + r[2]
+    if (d > 0) pts[a] <- pts[a] + 3 else if (d < 0) pts[b] <- pts[b] + 3 else { pts[a] <- pts[a] + 1; pts[b] <- pts[b] + 1 }
+  }
+  o <- order(-pts, -gd, -gf, runif(4))
+  list(team = idx[o], pts = pts[o], gd = gd[o], gf = gf[o])
+}
+
+sim_ko_round <- function(tm, m) {
+  k <- length(tm) / 2
+  out <- integer(k)
+  for (s in seq_len(k)) {
+    i <- tm[2 * s - 1]; j <- tm[2 * s]
+    r <- sim_match(i, j, m)
+    out[s] <- if (r[1] > r[2]) i else if (r[2] > r[1]) j else if (runif(1) < 0.5) i else j
+  }
+  out
+}
+
+sim_tournament <- function(m) {
+  if (m$type == "bayes") m <- draw_wdl(m)       # new posterior draw for every simulated tournament
+  win <- run <- third <- integer(12)
+  tstat <- matrix(0, 12, 4)
+  for (g in 1:12) {
+    s <- sim_group(groups[[g]], m)
+    win[g] <- s$team[1]; run[g] <- s$team[2]; third[g] <- s$team[3]
+    tstat[g, ] <- c(s$pts[3], s$gd[3], s$gf[3], runif(1))
+  }
+  best <- third[order(-tstat[, 1], -tstat[, 2], -tstat[, 3], tstat[, 4])[1:8]]
+  tm <- sample(c(win, run, best))
+  while (length(tm) > 1) tm <- sim_ko_round(tm, m)
+  tm
+}
+```
+
+```{r sim-run}
+n_sims <- as.integer(params$n_sims)
+set.seed(params$seed)
+
+run_model <- function(name) {
+  champ <- vapply(seq_len(n_sims), function(k) sim_tournament(models[[name]]), numeric(1))
+  tab <- table(factor(wc_teams[champ], levels = wc_teams))
+  tibble(Champion = names(tab), prob = as.numeric(tab) / n_sims, Model = name)
+}
+
+timing <- system.time({
+  all_champs <- bind_rows(lapply(names(models), run_model))
+})
+all_champs$Model <- factor(all_champs$Model, levels = names(models))
+cat(sprintf("%s simulations x %d models in %.0f seconds (seed %s)\n",
+            format(n_sims, big.mark = ","), length(models), timing[["elapsed"]], params$seed))
+```
+
+# 8. Champion probabilities
+
+```{r mc-table}
+top_by_model <- all_champs %>% group_by(Model) %>% slice_max(prob, n = 10, with_ties = FALSE) %>% ungroup()
+top_teams <- unique(top_by_model$Champion)
+
+comparison <- all_champs %>%
+  filter(Champion %in% top_teams) %>%
+  mutate(prob = round(100 * prob, 1)) %>%
+  pivot_wider(names_from = Model, values_from = prob, values_fill = 0) %>%
+  mutate(Average = round((`Dynamic Bayesian BT` + `Bivariate Poisson` + Elo) / 3, 1)) %>%
+  arrange(desc(Average)) %>%
+  mutate(Rank = row_number()) %>%
+  dplyr::select(Rank, Champion, `Dynamic Bayesian BT`, `Bivariate Poisson`, Elo, Average)
+
+comparison %>%
+  gt() %>%
+  tab_header(title = md("**2026 FIFA World Cup: probability of winning the tournament**"),
+             subtitle = sprintf("%s simulations per model", format(n_sims, big.mark = ","))) %>%
+  fmt_number(columns = -c(Rank, Champion), decimals = 1, pattern = "{x}%") %>%
+  tab_style(cell_fill(color = "#ffd700"), cells_body(rows = Rank <= 3)) %>%
+  tab_style(cell_fill(color = "#c0c0c0"), cells_body(rows = Rank %in% 4:5)) %>%
+  tab_style(cell_fill(color = "#cd7f32"), cells_body(rows = Rank %in% 6:10)) %>%
+  tab_source_note(sprintf("Monte Carlo standard error is at most %.2f percentage points (sqrt(0.25 / N)). A team missing from a model's top 10 shows 0.0%%.",
+                          100 * sqrt(0.25 / n_sims)))
+```
+
+```{r win-prob-share}
+all_champs %>% group_by(Model) %>%
+  summarise(`Top-1 prob` = max(prob), `Top-5 combined` = sum(sort(prob, decreasing = TRUE)[1:5]),
+            `Effective no. of contenders` = 1 / sum(prob^2), .groups = "drop") %>%
+  gt() %>%
+  tab_header(title = "How concentrated is each model's forecast?") %>%
+  fmt_percent(c(`Top-1 prob`, `Top-5 combined`), decimals = 1) %>%
+  fmt_number(`Effective no. of contenders`, decimals = 1)
+```
+
+# 9. Visualisations
+
+```{r theme}
+wc_theme <- theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 15),
+        plot.subtitle = element_text(size = 11, colour = "grey40"),
+        plot.caption = element_text(size = 9, colour = "grey55"),
+        axis.title = element_text(face = "bold"),
+        panel.grid.minor = element_blank(), legend.position = "bottom")
+```
+
+## 9.1 Elo rating progression, top 10 teams
+
+```{r elo-progress, fig.height=7}
+top10_elo <- elo_tbl$team[1:10]
+snap <- f_elo$history %>%
+  filter(team %in% top10_elo) %>%
+  mutate(month = floor_date(Date, "month")) %>%
+  group_by(team, month) %>% slice_tail(n = 1) %>% ungroup()
+end_labels <- snap %>% group_by(team) %>% slice_tail(n = 1) %>% ungroup()
+
+ggplot(snap, aes(month, elo, colour = team, group = team)) +
+  geom_line(linewidth = 1.05, alpha = 0.9) +
+  geom_point(data = end_labels, size = 2.8) +
+  geom_label_repel(data = end_labels, aes(label = team), size = 3.1, nudge_x = 60,
+                   direction = "y", segment.colour = "grey55") +
+  scale_colour_viridis_d(option = "turbo", guide = "none") +
+  scale_x_date(date_labels = "%b '%y", date_breaks = "6 months", expand = expansion(mult = c(0.02, 0.12))) +
+  labs(title = "Elo rating progression: top 10 teams",
+       subtitle = "Competition-weighted K-factor, margin-of-victory multiplier",
+       x = NULL, y = "Elo rating",
+       caption = "All teams start at 1500; last rating in each month shown") +
+  wc_theme + theme(axis.text.x = element_text(angle = 35, hjust = 1))
+```
+
+## 9.2 Do the models agree?
+
+```{r heatmap, fig.width=7, fig.height=5.5}
+rank_cor <- combined %>% dplyr::select(BT = rank_bt, Poisson = rank_pois, Elo = rank_elo) %>% cor(method = "spearman")
+cor_df <- as.data.frame(as.table(rank_cor)) %>% rename(Model1 = Var1, Model2 = Var2, Correlation = Freq)
+
+ggplot(cor_df, aes(Model1, Model2, fill = Correlation, label = round(Correlation, 2))) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(size = 5, fontface = "bold") +
+  scale_fill_gradient2(low = "#E63946", mid = "white", high = "#2A9D8F",
+                       midpoint = 0.5, limits = c(0, 1), name = "Spearman") +
+  labs(title = "Model agreement: rank correlation",
+       subtitle = "Higher means the models order the teams more similarly",
+       x = NULL, y = NULL,
+       caption = sprintf("Spearman correlation of ranks across all %d rated teams", nrow(combined))) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5, colour = "grey40"),
+        axis.text = element_text(face = "bold"), panel.grid = element_blank())
+```
+
+## 9.3 Champion probabilities
+
+```{r champion-race, fig.height=7.5}
+top8 <- unique(unlist(lapply(split(all_champs, all_champs$Model),
+                             function(d) head(d$Champion[order(-d$prob)], 8))))
+champion_race <- all_champs %>%
+  filter(Champion %in% top8) %>%
+  mutate(Champion = factor(Champion, levels = rev(unique(Champion[order(-ave(prob, Champion, FUN = mean))]))))
+
+ggplot(champion_race, aes(prob, Champion, fill = Model)) +
+  geom_col(position = position_dodge(0.85), width = 0.75, alpha = 0.9) +
+  geom_text(aes(label = sprintf("%.1f%%", prob * 100)),
+            position = position_dodge(0.85), hjust = -0.15, size = 3.2) +
+  scale_fill_manual(values = c("Dynamic Bayesian BT" = "#E63946", "Bivariate Poisson" = "#457B9D", "Elo" = "#2A9D8F"),
+                    name = "Model") +
+  scale_x_continuous(labels = percent_format(accuracy = 1), limits = c(0, max(champion_race$prob) * 1.15)) +
+  labs(title = "World Cup champion probabilities: top contenders",
+       subtitle = sprintf("%s simulations per model", format(n_sims, big.mark = ",")),
+       x = "Probability of winning the tournament", y = NULL,
+       caption = sprintf("Monte Carlo standard error at most %.1f percentage points | 2026 format (48 teams)",
+                         100 * sqrt(0.25 / n_sims))) +
+  wc_theme + theme(panel.grid.major.y = element_blank())
+```
+
+## 9.4 Posterior uncertainty in team strength
+
+The Bayesian model gives a full distribution for every team, not only a point estimate. The plot shows the 20 strongest
+teams with their 90% credible intervals. Overlapping intervals mean the data cannot separate those teams with confidence,
+which is why the champion probabilities are spread out.
+
+```{r uncertainty, fig.height=7}
+bt_tbl %>%
+  slice_head(n = 20) %>%
+  ggplot(aes(ability, reorder(team, ability))) +
+  geom_linerange(aes(xmin = lo, xmax = hi), linewidth = 2.5, colour = "#A8DADC") +
+  geom_point(size = 3, colour = "#E63946") +
+  labs(title = "Strength of the top 20 teams: posterior mean and 90% credible interval",
+       subtitle = "Final period, log-odds scale (larger = stronger)",
+       x = "Strength", y = NULL,
+       caption = "Wider interval = less certain; intervals come from the HMC posterior") +
+  wc_theme
+```
+
+# 10. Notes, assumptions and limitations
+
+**Corrections to the original script**
+
+* Competition names in the data use an em dash and "América", but the weight tables used a hyphen and "America", so
+  qualifiers and Copa América silently received the default weight. Names are now normalised, and an assertion
+  fails if any competition has no weight.
+* `all_champs` was used but never created; it is now built from the simulation output.
+* The Bradley-Terry fit ignored drawn matches; draws now count as half-wins.
+* The "Poisson" ratings were z-scores of goal difference; they are now fitted by penalised Poisson regression with a shared-component (bivariate) goal correlation.
+* Bradley-Terry win probabilities plus a fixed 22% draw probability could exceed 1; draw probabilities now depend on how even the match is.
+* Team-name cleaning no longer strips uppercase prefixes (it merged "DR Congo" with "Congo").
+* Seeds are set once, hard-coded Windows output paths are removed (tables and plots are shown in the report) and the figure captions now describe what is actually drawn.
+
+**Limitations**
+
+* The latest match in the data is `r format(t_now)`, so anything after that date (including the tournament itself) is not seen by the models.
+  The CONMEBOL World Cup qualifiers are not available in the `worldfootballR` source, so South American teams are rated on fewer competitive matches than other confederations.
+* The estimated shared goal component is `lambda3 = ` `r sprintf("%.3f", f_pois$l3)`. It is floored at zero, so a value of 0 means that, after allowing for team strengths and
+  home advantage, the two teams' goals are not positively correlated in this data and the model reduces to independent Poisson. The bivariate machinery is kept so that the
+  comparison is a fair test of the idea, but it adds nothing here.
+* The 48-team field is the 48 strongest teams by composite rating, not the actual qualifiers and draw, and there is no host-nation advantage (USA, Canada, Mexico).
+* The knockout bracket is a random draw rather than FIFA's fixed bracket, and drawn knockout matches are 50/50.
+* Home advantage is estimated in the Poisson and Bayesian models but not in the static Bradley-Terry or Elo models, so the back-test uses neutral-venue predictions for all models.
+* Venue is not recorded for every match. The Bayesian model treats tournament finals as neutral and every other match as a home match for the first-listed team.
+* The Bayesian model does not use competition weights: every match counts equally. Strength can only change through the random walk, so one-off results in minor matches can move ratings more than they should.
+* The random-walk volatility is shared by all teams. A model with team-specific volatility (for example for teams that change coaches) would be more flexible.
+* The back-test is a single time split; a rolling-origin evaluation would give a more stable comparison.
+* **Posterior predictive check 2 shows a misfit in the draw model.** In the largest strength-gap quintile the observed draw rate is
+  `r sprintf("%.1f%%", 100 * ppc2$obs[5])` against a replicated median of `r sprintf("%.1f%%", 100 * ppc2$med[5])`
+  (ppp = `r sprintf("%.2f", ppc2$ppp[5])`). The Davidson form lets the draw probability fall only slowly as the gap grows, so it gives mismatched
+  teams too many draws if the observed rate is lower. A model in which the draw parameter depends on the gap would fix this.
+* **Check 3 flags at least one period** where the first-listed team's win share is unusually high (smallest ppp across periods
+  = `r sprintf("%.2f", min(ppc3$ppp, 1 - ppc3$ppp))`). With 16 periods tested, one small value is partly expected, but it suggests the home-advantage term may vary over time.
+* **Check 4 is conservative.** `r sum(team_ppc$outside)` of `r nrow(team_ppc)` teams fall outside their 90% band where about 10% would be
+  expected by chance. The team results were used to fit the model, so this check cannot easily fail. It does not show that every team is well described.
+* **Sampler caveat.** The drift volatility $\sigma_{\text{drift}}$ mixes more slowly than the other parameters
+  (R-hat `r sprintf("%.3f", dyn$hyper_summary["sigma_drift", "Rhat"])`, effective sample size `r sprintf("%.0f", dyn$hyper_summary["sigma_drift", "n_eff"])`).
+  All strength parameters meet the usual thresholds, but for a stricter result increase `iter` (this needs `refit: true`).
+* The Bayesian predictive probabilities for the tournament are conditional on the model being right. The posterior predictive checks above show where it is, and is not, a good description of the data.
