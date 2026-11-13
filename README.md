@@ -3,6 +3,8 @@
 This note explains the Bradley-Terry (BT) model used in `WC2026_BT_vs_Elo.Rmd`.
 It gives the maths, the fitting method, the extensions and the results.
 
+Rendered report: [WC2026_BT_vs_Elo on RPubs](https://rpubs.com/PRC/1475935)
+
 ## 1. Problem
 
 Input: results of paired contests between teams.
@@ -18,7 +20,7 @@ BT solves this. It rates all teams on one scale from all results together.
 Each team *i* has a positive strength $\pi_i$. Write $\pi_i = e^{\beta_i}$.
 
 $$
-P(i \text{ beats } j) = \frac{\pi_i}{\pi_i + \pi_j} = \frac{1}{1 + e^{-(\beta_i - \beta_j)}} = \operatorname{logit}^{-1}(\beta_i - \beta_j)
+P(i \text{ beats } j) = \frac{\pi_i}{\pi_i + \pi_j} = \frac{1}{1 + e^{-(\beta_i - \beta_j)}} = \mathrm{logit}^{-1}(\beta_i - \beta_j)
 $$
 
 Key points:
@@ -34,7 +36,7 @@ Let $y_{ij} = 1$ if *i* wins, else 0. Let $w_{ij}$ be the weight of the match.
 **Log-likelihood**
 
 $$
-\ell(\beta) = \sum_{\text{matches}} w_{ij}\Big[\, y_{ij}\log p_{ij} + (1-y_{ij})\log(1-p_{ij}) \Big], \qquad p_{ij} = \operatorname{logit}^{-1}(\beta_i-\beta_j)
+\ell(\beta) = \sum_{\text{matches}} w_{ij}\Big[\, y_{ij}\log p_{ij} + (1-y_{ij})\log(1-p_{ij}) \Big], \qquad p_{ij} = \mathrm{logit}^{-1}(\beta_i-\beta_j)
 $$
 
 **Score equations.** Set $\partial \ell / \partial \beta_i = 0$:
@@ -117,7 +119,7 @@ $\bar d$ is the weighted draw rate in the training data. Draws are most likely w
 Add a constant *h* when team *i* plays at home:
 
 $$
-P(i \text{ beats } j) = \operatorname{logit}^{-1}(\beta_i - \beta_j + h)
+P(i \text{ beats } j) = \mathrm{logit}^{-1}(\beta_i - \beta_j + h)
 $$
 
 In `BTm`, use a covariate `at.home` in the formula. This project does not include *h* in BT.
